@@ -1,0 +1,49 @@
+{
+  "format": "ffmpeg-lgpl-build/1",
+  "$comment": [
+    "The pin of this repository's one build. Everything the build takes from outside is named here: change a value in a pull request, never in a script.",
+    "The weekly upstream check (.github/workflows/upstream.yml) opens a pull request that moves btbn.commit and ffmpeg.commit/describe; merging it to main builds and publishes a release.",
+    "The toolchain images are built from scratch by BtbN's own makeimage.sh at btbn.commit, FROM the Ubuntu index digest below. Their apt, rustup and crosstool-ng inputs are not pinned (BtbN's do not pin them either): a release is the same scripts and the same sources, not the same bytes. The sha256 of each release's zip is what a consumer pins.",
+    "BtbN's ghcr.io images (ghcr.io/btbn/ffmpeg-builds/base, base-win64) are not used: they are rebuilt daily under a moving :latest tag, and BtbN's cleanup deletes the untagged older digests, so a digest of theirs stops resolving within days."
+  ],
+  "btbn": {
+    "repo": "BtbN/FFmpeg-Builds",
+    "commit": "8267213e26c1031621e6e1210fe3aa4867214f6a",
+    "branch": "master",
+    "matches_asset_tag": "autobuild-2026-08-31-13-27"
+  },
+  "ffmpeg": {
+    "repo": "https://github.com/FFmpeg/FFmpeg.git",
+    "branch": "release/9.0",
+    "commit": "e47273f4d9227152dcbf543cebaf9e2430ddbcc4",
+    "describe": "n9.0.1-11-ge47273f4d9"
+  },
+  "target": "win64",
+  "variant": "lgpl-shared",
+  "addins": [
+    "9.0"
+  ],
+  "remove_scripts": {
+    "scripts.d/50-chromaprint.sh": "Chromaprint, an audio-fingerprint muxer we do not use. It links FFTW, which is GPL-2.0-or-later, statically into avformat (found in the shipped BtbN avformat-63.dll: fftw-3.3.11, 1017 strings).",
+    "scripts.d/25-fftw3.sh": "FFTW itself. In the lgpl variants only Chromaprint depends on it; the other dependent, 50-rubberband.sh, is disabled for every lgpl variant (its ffbuild_enabled returns -1), so nothing in win64 lgpl-shared needs it.",
+    "scripts.d/50-zvbi.sh": "libzvbi, DVB teletext, which we accept losing. Its COPYING.md puts packet-830 and pdc under GPL-2.0 only."
+  },
+  "dependency_check": "At btbn.commit, grep of scripts.d, variants, addins and util for chromaprint|fftw|zvbi finds: 50-chromaprint.sh (itself, and 'echo fftw3'), 50-rubberband.sh ('echo fftw3', disabled for lgpl), 50-zvbi.sh (itself), zz-final.sh ('echo chromaprint', 'echo zvbi' in its ffbuild_depends list). Nothing else. zz-final.sh is the build's entry script: a dependency on a removed script is silently dropped by generate.sh ('|| continue'), so the two lines are deleted explicitly (scripts/apply-patches.sh) and the finished configure line is checked (scripts/verify.py).",
+  "edit_files": {
+    "scripts.d/zz-final.sh": "delete the lines 'echo chromaprint' and 'echo zvbi' from ffbuild_depends",
+    "images/base/Dockerfile": "FROM ubuntu:26.04 becomes FROM ubuntu:26.04@<images.ubuntu.digest>",
+    "build.sh": "after 'cd ffmpeg', 'git checkout --detach <ffmpeg.commit>': BtbN builds the branch head; this builds the commit above"
+  },
+  "images": {
+    "mode": "built-from-scratch",
+    "ubuntu": {
+      "ref": "ubuntu:26.04",
+      "digest": "sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7",
+      "read": "2026-10-11, the multi-arch index at registry-1.docker.io/v2/library/ubuntu/manifests/26.04"
+    },
+    "not_used": {
+      "ghcr.io/btbn/ffmpeg-builds/base": "sha256:1f0d623e6c08e15e77e8cf00b0769f0e0e9a19915ffb901f423b5791287fffd5 (:latest on 2026-10-11)",
+      "ghcr.io/btbn/ffmpeg-builds/base-win64": "sha256:f27c68da9e353b5fcef0396fb5d5112b969eb6c9fb02e8df484c0fea130016e7 (:latest on 2026-10-11)"
+    }
+  }
+}

@@ -1,0 +1,214 @@
+# Build the LGPL FFmpeg and publish it as a release of this repository.
+#
+# Triggers: a push to main that changes build.json (a merged upstream bump, or a hand edit of the pin), or a manual dispatch.
+# A dispatch from a branch other than main is a dry run: it builds and verifies, and publishes nothing (that is how a bump
+# pull request is checked before it is merged). The weekly check of BtbN's and FFmpeg's heads is upstream.yml.
+#
+# Permissions: nothing by default. Every job asks for what it needs; only the release job can write, and it runs no code from this
+# repository or from the build: it checks the artifact against its own checksum list and hands the files to `gh release create`.
+# No secret is used. pull_request_target is never used; the pull_request event is not a trigger at all, so a fork's pull request
+# builds nothing here.
+name: Build FFmpeg
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the release (only from main; any other branch is a dry run whatever this says)"
+        type: boolean
+        default: true
+      revision:
+        description: "Rebuild an already published pin: a small number N adds -rN to the tag"
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    paths: [build.json]
+
+permissions: {}
+
+concurrency:
+  group: ffmpeg-build
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      asset: ${{ steps.plan.outputs.asset }}
+      btbn_commit: ${{ steps.plan.outputs.btbn_commit }}
+      ffmpeg_commit: ${{ steps.plan.outputs.ffmpeg_commit }}
+      ffmpeg_describe: ${{ steps.plan.outputs.ffmpeg_describe }}
+      publish: ${{ steps.decide.outputs.publish }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pin
+        id: plan
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: python3 scripts/plan.py build.json --revision "$REVISION"
+      - name: Decide whether to build and to publish
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          publish=false
+          if [ "$REF" = "refs/heads/main" ] && { [ "$EVENT" = "push" ] || [ "$PUBLISH_INPUT" = "true" ]; }; then publish=true; fi
+          build=true
+          # The very first push to main (the repository's first commit, before = 40 zeros) changes build.json by definition: it
+          # builds nothing; the first release is a deliberate dispatch.
+          if [ "$EVENT" = "push" ] && [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            publish=false
+            build=false
+            echo "::notice::The first push to main builds nothing: dispatch Build FFmpeg for the first release."
+          fi
+          if [ "$publish" = "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "::notice::Release $TAG already exists: nothing to build. Dispatch with revision=2 to rebuild the same pin."
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and verify
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo apt-get clean
+          docker system prune -a -f
+          sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android /usr/share/dotnet
+          df -h /
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: lgpl
+          persist-credentials: false
+      - name: Check out BtbN/FFmpeg-Builds at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: BtbN/FFmpeg-Builds
+          ref: ${{ needs.plan.outputs.btbn_commit }}
+          path: btbn
+          persist-credentials: false
+      - name: Check the BtbN checkout is the pinned commit
+        env:
+          WANT: ${{ needs.plan.outputs.btbn_commit }}
+        run: |
+          got="$(git -C btbn rev-parse HEAD)"
+          [ "$got" = "$WANT" ] || { echo "::error::BtbN checkout is $got, build.json pins $WANT"; exit 1; }
+      - name: Apply this repository's changes to BtbN's scripts
+        run: python3 lgpl/scripts/apply_patches.py lgpl/build.json btbn
+      - name: Run this repository's own tests
+        run: cd lgpl && python3 -I -m unittest discover -s tests
+      - name: Build the toolchain images and the packages (BtbN's makeimage.sh, then build.sh)
+        working-directory: btbn
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          set -eo pipefail
+          ./makeimage.sh win64 lgpl-shared 9.0
+          ./build.sh win64 lgpl-shared 9.0
+          ls -la artifacts
+      - name: Unpack the package
+        id: unpack
+        env:
+          PLANNED: ${{ needs.plan.outputs.asset }}
+        run: |
+          set -e
+          # build.sh names the zip from `git describe` of the FFmpeg checkout; the pin names the same commit, so the name is the planned one
+          # unless git abbreviates the hash differently. Take the one zip that was built, and say so when its name is not the planned one.
+          n="$(ls btbn/artifacts/*.zip | wc -l)"
+          [ "$n" = "1" ] || { echo "::error::expected one zip in btbn/artifacts, found $n"; ls btbn/artifacts; exit 1; }
+          asset="$(basename btbn/artifacts/*.zip .zip)"
+          [ "$asset" = "$PLANNED" ] || echo "::warning::build.sh named the package $asset, the pin planned $PLANNED"
+          mkdir unpacked && unzip -q "btbn/artifacts/$asset.zip" -d unpacked
+          [ -d "unpacked/$asset/bin" ] || { echo "::error::the zip has no $asset/bin"; ls unpacked; exit 1; }
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PWD/unpacked/$asset" >> "$GITHUB_OUTPUT"
+      - name: Verify (nothing is published unless this passes)
+        env:
+          PKG: ${{ steps.unpack.outputs.pkg }}
+        run: |
+          mkdir dist
+          python3 lgpl/scripts/verify.py "$PKG" --configure-out dist/configure.txt
+          python3 lgpl/scripts/tree_hash.py "$PKG" | cut -d' ' -f1 > dist/tree.sha256
+      - name: List what the build can do (capabilities.txt), running ffmpeg.exe under Wine in the build image
+        env:
+          PKG: ${{ steps.unpack.outputs.pkg }}
+        run: |
+          set -e
+          image="$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '/win64-lgpl-shared-9\.0:latest$' | head -n 1)"
+          [ -n "$image" ] || { echo "::error::the build image is not in the local docker"; exit 1; }
+          python3 lgpl/scripts/capabilities.py --out dist/capabilities.txt \
+            --ffmpeg "docker run --rm -i -e WINEDEBUG=-all -v $PKG:/pkg $image wine /pkg/bin/ffmpeg.exe"
+      - name: Collect the source (the source offer)
+        run: |
+          set -e
+          branch="$(python3 -c 'import json;print(json.load(open("lgpl/build.json"))["ffmpeg"]["branch"])')"
+          git clone --filter=blob:none --branch "$branch" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          bash lgpl/scripts/source_bundle.sh btbn ffmpeg-src lgpl lgpl/build.json dist
+      - name: Assemble the release files
+        env:
+          ASSET: ${{ steps.unpack.outputs.asset }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -e
+          cp "btbn/artifacts/$ASSET.zip" dist/
+          cp lgpl/build.json dist/build.json
+          (cd dist && sha256sum "$ASSET.zip" > "$ASSET.zip.sha256" && sha256sum -- * | grep -v -E ' (SHA256SUMS|NOTES.md)$' > SHA256SUMS)
+          python3 lgpl/scripts/release_notes.py lgpl/build.json dist "$TAG" "$ASSET" > dist/NOTES.md
+          cat dist/SHA256SUMS
+          du -sh dist
+      - name: Upload the release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
+      - name: Check the files against their checksum list
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -e
+          files="$(ls dist | grep -v '^NOTES.md$' | sed 's|^|dist/|')"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file dist/NOTES.md $files

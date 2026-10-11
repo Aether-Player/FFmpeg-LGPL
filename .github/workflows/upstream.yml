@@ -1,0 +1,117 @@
+# Weekly: has BtbN/FFmpeg-Builds' default branch or FFmpeg's release branch moved past the commits build.json pins?
+# If so, open a pull request that bumps build.json. This workflow builds nothing and publishes nothing, and never pushes to main.
+# What happens next:
+#   - a dry run to check the bump: Actions > Build FFmpeg > Run workflow, "Use workflow from" the bump branch (it builds and
+#     verifies, and publishes nothing because the branch is not main);
+#   - merging the pull request to main changes build.json, which makes build.yml build, verify and publish the release.
+# A run with nothing new does nothing and stays green. The pull request is opened with the repository's GITHUB_TOKEN, so the repo
+# setting "Allow GitHub Actions to create and approve pull requests" must be on.
+name: Check upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ffmpeg-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Compare the heads with the pin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.heads.outputs.changed }}
+      btbn_head: ${{ steps.heads.outputs.btbn_head }}
+      ffmpeg_head: ${{ steps.heads.outputs.ffmpeg_head }}
+      ffmpeg_describe: ${{ steps.heads.outputs.ffmpeg_describe }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the heads
+        id: heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          btbn_repo="$(jq -r .btbn.repo build.json)"; btbn_branch="$(jq -r .btbn.branch build.json)"; btbn_pinned="$(jq -r .btbn.commit build.json)"
+          ff_branch="$(jq -r .ffmpeg.branch build.json)"; ff_pinned="$(jq -r .ffmpeg.commit build.json)"
+          btbn_head="$(gh api "repos/$btbn_repo/branches/$btbn_branch" --jq .commit.sha)"
+          ffmpeg_head="$(gh api "repos/FFmpeg/FFmpeg/branches/$ff_branch" --jq .commit.sha)"
+          echo "BtbN   pinned $btbn_pinned  head $btbn_head"
+          echo "FFmpeg pinned $ff_pinned  head $ffmpeg_head"
+          changed=false
+          describe=""
+          if [ "$btbn_head" != "$btbn_pinned" ] || [ "$ffmpeg_head" != "$ff_pinned" ]; then
+            changed=true
+            git clone --bare --filter=blob:none --branch "$ff_branch" https://github.com/FFmpeg/FFmpeg.git ff.git
+            describe="$(git -C ff.git describe --tags --match 'n[0-9]*' --abbrev=10 "$ffmpeg_head")"
+            echo "FFmpeg head is $describe"
+          fi
+          {
+            echo "changed=$changed"
+            echo "btbn_head=$btbn_head"
+            echo "ffmpeg_head=$ffmpeg_head"
+            echo "ffmpeg_describe=$describe"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$changed" = "false" ]; then echo "::notice::Nothing new upstream: build.json is current."; fi
+
+  propose:
+    name: Open the bump pull request
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Bump build.json on a branch and open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BTBN_HEAD: ${{ needs.check.outputs.btbn_head }}
+          FFMPEG_HEAD: ${{ needs.check.outputs.ffmpeg_head }}
+          FFMPEG_DESCRIBE: ${{ needs.check.outputs.ffmpeg_describe }}
+        run: |
+          set -euo pipefail
+          branch="bump/btbn-${BTBN_HEAD:0:7}-ffmpeg-${FFMPEG_HEAD:0:10}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::$branch already exists: the pull request for this upstream state is open or was closed on purpose."
+            exit 0
+          fi
+          old_btbn="$(jq -r .btbn.commit build.json)"
+          old_ffmpeg="$(jq -r .ffmpeg.commit build.json)"
+          old_describe="$(jq -r .ffmpeg.describe build.json)"
+          python3 scripts/bump_build_json.py build.json --btbn-commit "$BTBN_HEAD" --ffmpeg-commit "$FFMPEG_HEAD" --ffmpeg-describe "$FFMPEG_DESCRIBE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "build.json: BtbN ${BTBN_HEAD:0:7}, FFmpeg $FFMPEG_DESCRIBE"
+          git push origin "$branch"
+          {
+            echo "Upstream moved past the commits \`build.json\` pins."
+            echo
+            echo "| | pinned | now |"
+            echo "|---|---|---|"
+            echo "| BtbN/FFmpeg-Builds | \`${old_btbn:0:12}\` | \`${BTBN_HEAD:0:12}\` ([diff](https://github.com/BtbN/FFmpeg-Builds/compare/${old_btbn}...${BTBN_HEAD})) |"
+            echo "| FFmpeg release branch | \`$old_describe\` | \`$FFMPEG_DESCRIBE\` ([diff](https://github.com/FFmpeg/FFmpeg/compare/${old_ffmpeg}...${FFMPEG_HEAD})) |"
+            echo
+            echo "**Before merging**, run the build as a dry run on this branch: Actions > Build FFmpeg > Run workflow, \"Use workflow from\" \`$branch\`. It applies the patch, builds, and runs every check (no Chromaprint, FFTW, libzvbi, GPL or nonfree), and publishes nothing because the branch is not main."
+            echo
+            echo "**Merging** this to main changes \`build.json\`, so \`build.yml\` builds again and publishes a new release."
+            echo
+            echo "If \`apply_patches.py\` fails in the dry run, BtbN changed a file the patch edits: fix the patch in this pull request."
+          } > body.md
+          gh pr create --base main --head "$branch" --title "Bump upstream: BtbN ${BTBN_HEAD:0:7}, FFmpeg $FFMPEG_DESCRIBE" --body-file body.md
