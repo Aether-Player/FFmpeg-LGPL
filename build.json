@@ -8,15 +8,14 @@
   ],
   "btbn": {
     "repo": "BtbN/FFmpeg-Builds",
-    "commit": "8267213e26c1031621e6e1210fe3aa4867214f6a",
-    "branch": "master",
-    "matches_asset_tag": "autobuild-2026-08-31-13-27"
+    "commit": "63ac3265b0789ea16c7b1f8351cd2ad195a28722",
+    "branch": "master"
   },
   "ffmpeg": {
     "repo": "https://github.com/FFmpeg/FFmpeg.git",
     "branch": "release/9.0",
-    "commit": "e47273f4d9227152dcbf543cebaf9e2430ddbcc4",
-    "describe": "n9.0.1-11-ge47273f4d9"
+    "commit": "7e93014c5bbb61e7c22afebb478bf92f7a08d59a",
+    "describe": "n9.0.2-27-g7e93014c5b"
   },
   "target": "win64",
   "variant": "lgpl-shared",
