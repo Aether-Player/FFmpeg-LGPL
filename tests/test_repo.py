@@ -18,18 +18,23 @@ import plan  # noqa: E402
 import tree_hash  # noqa: E402
 
 PIN = json.loads((ROOT / "build.json").read_text(encoding="utf-8"))
+# A fixed pin for the naming tests: PIN is the live build.json, which every upstream bump changes.
+FIXED = copy.deepcopy(PIN)
+FIXED.update(target="win64", variant="lgpl-shared", addins=["9.0"])
+FIXED["btbn"]["commit"] = "8267213e26c1031621e6e1210fe3aa4867214f6a"
+FIXED["ffmpeg"].update(commit="e47273f4d9227152dcbf543cebaf9e2430ddbcc4", describe="n9.0.1-11-ge47273f4d9")
 
 
 class Plan(unittest.TestCase):
     def test_tag_and_asset_follow_the_pin(self):
-        p = plan.plan(PIN)
+        p = plan.plan(FIXED)
         self.assertEqual(p["tag"], "ffmpeg-n9.0.1-11-ge47273f4d9-btbn-8267213")
         self.assertEqual(p["asset"], "ffmpeg-n9.0.1-11-ge47273f4d9-win64-lgpl-shared-9.0")
 
     def test_revision_suffix(self):
-        self.assertTrue(plan.plan(PIN, "2")["tag"].endswith("-btbn-8267213-r2"))
+        self.assertTrue(plan.plan(FIXED, "2")["tag"].endswith("-btbn-8267213-r2"))
         with self.assertRaises(SystemExit):
-            plan.plan(PIN, "2; rm -rf")
+            plan.plan(FIXED, "2; rm -rf")
 
     def test_a_describe_that_does_not_match_its_commit_is_refused(self):
         bad = copy.deepcopy(PIN)
